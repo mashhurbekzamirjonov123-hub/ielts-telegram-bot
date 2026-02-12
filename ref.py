@@ -22,8 +22,9 @@ except RuntimeError:
 
 # ================== CONFIG ==================
 # IMPORTANT: do NOT hardcode token in code when hosting
-TOKEN = os.environ.get("TOKEN")  # set in env; for local test you can export/set it
-BOT_USERNAME = os.environ.get("BOT_USERNAME", "JonibekIELTS_bot").lstrip("@")
+TOKEN = "7954330145:AAHjGUNYuxN52zv6O8JvQ_1c0PR6MGd5ulw"
+BOT_USERNAME = "JonibekIELTS_bot"
+
 
 # initial seed admins (will be copied into DB on first run)
 ADMIN_IDS = {908588571}
@@ -603,3 +604,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+
