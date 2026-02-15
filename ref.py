@@ -21,15 +21,17 @@ except RuntimeError:
     asyncio.set_event_loop(asyncio.new_event_loop())
 
 # ================== CONFIG ==================
-# For now you hardcoded token (works). Later move to env.
-TOKEN = "PASTE_YOUR_TOKEN_HERE"
-BOT_USERNAME = "JonibekIELTS_bot"  # without @
+# IMPORTANT: do NOT hardcode token in code when hosting
+TOKEN = "7954330145:AAHjGUNYuxN52zv6O8JvQ_1c0PR6MGd5ulw"
+BOT_USERNAME = "@JonibekIELTS_bot"
 
+# initial seed admins (will be copied into DB on first run)
 ADMIN_IDS = {908588571}
 
 DEFAULT_REQUIRED_CHATS = ["@jonibeksielts9"]
 DEFAULT_NEED_REFERRALS = 3
 
+# reward invite constraints
 INVITE_MEMBER_LIMIT = 1
 INVITE_EXPIRE_SECONDS = 3600
 
@@ -84,15 +86,6 @@ CREATE TABLE IF NOT EXISTS issued_invites (
   user_id INTEGER PRIMARY KEY,
   invite_link TEXT NOT NULL,
   expire_ts INTEGER NOT NULL
-)
-""")
-
-# >>> NEW: referral counting happens ONLY after invitee joins required chats
-cur.execute("""
-CREATE TABLE IF NOT EXISTS referral_events (
-  invitee_id INTEGER PRIMARY KEY,
-  inviter_id INTEGER NOT NULL,
-  counted INTEGER NOT NULL DEFAULT 0
 )
 """)
 
@@ -180,36 +173,23 @@ def get_user(uid: int) -> Tuple[Optional[int], int]:
         return (None, 0)
     return (row[0], row[1])
 
-def referral_link(uid: int) -> str:
-    u = BOT_USERNAME.strip().lstrip("@")
-    return f"https://t.me/{u}?start={uid}"
-
-# ---------------- referral logic (NEW) ----------------
-def record_referral(invitee_id: int, inviter_id: int) -> None:
-    """Store who invited this user (only once). Do NOT count yet."""
-    if invitee_id == inviter_id:
-        return
-    cur.execute(
-        "INSERT OR IGNORE INTO referral_events(invitee_id, inviter_id, counted) VALUES (?, ?, 0)",
-        (invitee_id, inviter_id),
-    )
-    conn.commit()
-
-def try_count_referral(invitee_id: int) -> bool:
-    """Count inviter's referral ONLY once (after invitee joins required chats)."""
-    cur.execute("SELECT inviter_id, counted FROM referral_events WHERE invitee_id=?", (invitee_id,))
-    row = cur.fetchone()
-    if not row:
+def set_invited_by(uid: int, inviter: int) -> bool:
+    invited_by, _ = get_user(uid)
+    if invited_by is not None:
         return False
-    inviter_id, counted = row
-    if counted:
+    if uid == inviter:
         return False
-
-    ensure_user(inviter_id)
-    cur.execute("UPDATE users SET referrals_count = referrals_count + 1 WHERE user_id=?", (inviter_id,))
-    cur.execute("UPDATE referral_events SET counted=1 WHERE invitee_id=?", (invitee_id,))
+    cur.execute("UPDATE users SET invited_by=? WHERE user_id=?", (inviter, uid))
     conn.commit()
     return True
+
+def inc_referrals(inviter: int) -> None:
+    ensure_user(inviter)
+    cur.execute("UPDATE users SET referrals_count = referrals_count + 1 WHERE user_id=?", (inviter,))
+    conn.commit()
+
+def referral_link(uid: int) -> str:
+    return f"https://t.me/{BOT_USERNAME}?start={uid}"
 
 # ---------------- optional rewards list (kept) ----------------
 def add_reward(link: str) -> None:
@@ -304,20 +284,20 @@ async def get_or_create_personal_invite(context: ContextTypes.DEFAULT_TYPE, uid:
     return invite.invite_link
 
 # ================== UI (buttons) ==================
-def build_join_keyboard() -> InlineKeyboardMarkup:
+def build_user_keyboard() -> InlineKeyboardMarkup:
     reqs = get_required_chats()
-    rows = []
+    join_buttons = []
     for c in reqs:
+        # button URL should be t.me/username without @
         if c.startswith("@"):
-            rows.append([InlineKeyboardButton(f"✅ Join {c}", url=f"https://t.me/{c[1:]}")])
-    rows.append([InlineKeyboardButton("✅ I joined, check", callback_data="check_status")])
-    return InlineKeyboardMarkup(rows)
+            join_buttons.append([InlineKeyboardButton(f"Join {c}", url=f"https://t.me/{c[1:]}")])
 
-def build_referral_keyboard() -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup([
-        [InlineKeyboardButton("🔗 My invite link", callback_data="my_link")],
+    actions = [
         [InlineKeyboardButton("✅ Check status", callback_data="check_status")],
-    ])
+        [InlineKeyboardButton("🔗 My invite link", callback_data="my_link")],
+    ]
+
+    return InlineKeyboardMarkup(join_buttons + actions)
 
 def build_admin_keyboard() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup([
@@ -326,57 +306,44 @@ def build_admin_keyboard() -> InlineKeyboardMarkup:
         [InlineKeyboardButton("👥 Admins", callback_data="admin_admins")],
     ])
 
-async def render_stage_message(context: ContextTypes.DEFAULT_TYPE, uid: int) -> Tuple[str, InlineKeyboardMarkup]:
+async def render_status_text(context: ContextTypes.DEFAULT_TYPE, uid: int) -> str:
     _, referrals = get_user(uid)
     need = get_need_referrals()
     joined = await joined_all(context, uid)
+    remaining = max(0, need - referrals)
 
     reqs = get_required_chats()
     req_text = "\n".join(f"• {c}" for c in reqs) if reqs else "• (none)"
 
-    # STAGE 1: must join first
-    if not joined:
-        text = (
-            "🔒 *Access locked*\n\n"
-            "First, join the required channel(s) below.\n"
-            "Then press *✅ I joined, check*.\n\n"
-            "Required channels:\n"
-            f"{req_text}"
-        )
-        return text, build_join_keyboard()
-
-    # If joined, count referral (if this user came from someone) ONCE
-    try_count_referral(uid)
-
-    # refresh referrals after possible increment elsewhere (not needed here, but ok)
-    _, referrals = get_user(uid)
-    remaining = max(0, need - referrals)
-
-    # STAGE 2: referrals
     text = (
-        "✅ *Subscribed confirmed*\n\n"
-        f"Now invite *{need}* friends using your personal link.\n\n"
-        f"👥 Referrals: *{referrals}/{need}*\n"
-        f"🔗 Your invite link:\n{referral_link(uid)}\n\n"
-        "Rules:\n"
-        "• Your friends must press Start from your link\n"
-        "• They must also join the required channel(s)\n"
+        "✅ IELTS Materials Access Bot\n\n"
+        f"👥 Referrals: {referrals}/{need}\n"
+        f"📌 Joined required channel(s): {'Yes' if joined else 'No'}\n\n"
+        "Required channels:\n"
+        f"{req_text}\n\n"
+        "How to unlock:\n"
+        f"1) Invite {need} friends using your link\n"
+        "2) They must press Start\n"
+        "3) You must join the required channel(s)\n"
     )
 
-    if referrals >= need:
+    if joined and referrals >= need:
         try:
             personal_invite = await get_or_create_personal_invite(context, uid)
             text += (
-                "\n🎁 *Unlocked!*\n"
-                "Your personal access link (1 use, limited time):\n"
+                "\n🎁 Unlocked!\n"
+                "Here is your PERSONAL access link (1 use, limited time):\n"
                 f"{personal_invite}"
             )
         except Exception:
             text += "\n🎁 Unlocked, but bot can't create invite links. Make bot admin in reward chat and allow invite links."
     else:
-        text += f"\n⏳ You still need *{remaining}* more referral(s)."
+        if not joined:
+            text += "\n⚠️ Join required channel(s), then press “Check status”."
+        if remaining > 0:
+            text += f"\n⏳ You still need {remaining} more referral(s)."
 
-    return text, build_referral_keyboard()
+    return text
 
 # ================== COMMANDS ==================
 async def myid(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -393,28 +360,26 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         except ValueError:
             inviter = None
 
-    # NEW: record referral but do NOT count yet
     if inviter:
         ensure_user(inviter)
-        record_referral(uid, inviter)
+        if set_invited_by(uid, inviter):
+            inc_referrals(inviter)
 
-    text, kb = await render_stage_message(context, uid)
+    text = await render_status_text(context, uid)
     await update.message.reply_text(
         text,
-        reply_markup=kb,
-        disable_web_page_preview=True,
-        parse_mode="Markdown"
+        reply_markup=build_user_keyboard(),
+        disable_web_page_preview=True
     )
 
 async def status(update: Update, context: ContextTypes.DEFAULT_TYPE):
     uid = update.effective_user.id
     ensure_user(uid)
-    text, kb = await render_stage_message(context, uid)
+    text = await render_status_text(context, uid)
     await update.message.reply_text(
         text,
-        reply_markup=kb,
-        disable_web_page_preview=True,
-        parse_mode="Markdown"
+        reply_markup=build_user_keyboard(),
+        disable_web_page_preview=True
     )
 
 # -------- buttons callbacks --------
@@ -425,8 +390,8 @@ async def on_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
     ensure_user(uid)
 
     if q.data == "check_status":
-        text, kb = await render_stage_message(context, uid)
-        await q.edit_message_text(text, reply_markup=kb, disable_web_page_preview=True, parse_mode="Markdown")
+        text = await render_status_text(context, uid)
+        await q.edit_message_text(text, reply_markup=build_user_keyboard(), disable_web_page_preview=True)
         return
 
     if q.data == "my_link":
@@ -532,8 +497,8 @@ async def addadmin_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("Usage: /addadmin <user_id>")
         return
     try:
-        auid = int(context.args[0])
-        ok = add_admin(auid)
+        uid = int(context.args[0])
+        ok = add_admin(uid)
         await update.message.reply_text("✅ Admin added." if ok else "ℹ️ Already an admin.")
     except ValueError:
         await update.message.reply_text("❌ user_id must be a number.")
@@ -545,12 +510,12 @@ async def deladmin_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("Usage: /deladmin <user_id>")
         return
     try:
-        auid = int(context.args[0])
+        uid = int(context.args[0])
         admins = list_admins()
-        if auid in admins and len(admins) == 1:
+        if uid in admins and len(admins) == 1:
             await update.message.reply_text("❌ Can't remove the last admin.")
             return
-        ok = remove_admin(auid)
+        ok = remove_admin(uid)
         await update.message.reply_text("✅ Admin removed." if ok else "❌ Not an admin.")
     except ValueError:
         await update.message.reply_text("❌ user_id must be a number.")
@@ -604,7 +569,7 @@ async def stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # ================== MAIN ==================
 def main():
     if not TOKEN:
-        raise RuntimeError("TOKEN is missing.")
+        raise RuntimeError("TOKEN is missing. Set environment variable TOKEN with your NEW bot token.")
     if not BOT_USERNAME:
         raise RuntimeError("BOT_USERNAME is missing (without @).")
 
@@ -612,10 +577,12 @@ def main():
 
     app = Application.builder().token(TOKEN).build()
 
+    # user commands
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("status", status))
     app.add_handler(CommandHandler("myid", myid))
 
+    # admin commands
     app.add_handler(CommandHandler("admin", admin))
     app.add_handler(CommandHandler("setneed", setneed))
     app.add_handler(CommandHandler("setrewardmode", setrewardmode_cmd))
@@ -628,6 +595,7 @@ def main():
     app.add_handler(CommandHandler("reqs", reqs_cmd))
     app.add_handler(CommandHandler("stats", stats))
 
+    # buttons
     app.add_handler(CallbackQueryHandler(on_button))
 
     print("Bot running... Ctrl+C to stop")
