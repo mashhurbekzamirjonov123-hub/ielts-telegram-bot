@@ -52,6 +52,15 @@ CREATE TABLE IF NOT EXISTS admins (
 """)
 
 cur.execute("""
+CREATE TABLE IF NOT EXISTS referral_events (
+  invitee_id INTEGER PRIMARY KEY,
+  inviter_id INTEGER NOT NULL,
+  counted INTEGER NOT NULL DEFAULT 0
+)
+""")
+conn.commit()
+
+cur.execute("""
 CREATE TABLE IF NOT EXISTS users (
   user_id INTEGER PRIMARY KEY,
   invited_by INTEGER,
@@ -99,6 +108,29 @@ def set_setting(key: str, value: str) -> None:
         (key, value),
     )
     conn.commit()
+def record_referral(invitee_id: int, inviter_id: int) -> None:
+    if invitee_id == inviter_id:
+        return
+    cur.execute(
+        "INSERT OR IGNORE INTO referral_events(invitee_id, inviter_id, counted) VALUES (?, ?, 0)",
+        (invitee_id, inviter_id),
+    )
+    conn.commit()
+
+def try_count_referral(invitee_id: int) -> bool:
+    cur.execute("SELECT inviter_id, counted FROM referral_events WHERE invitee_id=?", (invitee_id,))
+    row = cur.fetchone()
+    if not row:
+        return False
+    inviter_id, counted = row
+    if counted:
+        return False
+
+    ensure_user(inviter_id)
+    cur.execute("UPDATE users SET referrals_count = referrals_count + 1 WHERE user_id=?", (inviter_id,))
+    cur.execute("UPDATE referral_events SET counted=1 WHERE invitee_id=?", (invitee_id,))
+    conn.commit()
+    return True
 
 def get_setting(key: str, default: str) -> str:
     cur.execute("SELECT value FROM settings WHERE key=?", (key,))
@@ -284,20 +316,20 @@ async def get_or_create_personal_invite(context: ContextTypes.DEFAULT_TYPE, uid:
     return invite.invite_link
 
 # ================== UI (buttons) ==================
-def build_user_keyboard() -> InlineKeyboardMarkup:
-    reqs = get_required_chats()
-    join_buttons = []
-    for c in reqs:
-        # button URL should be t.me/username without @
+def build_join_keyboard() -> InlineKeyboardMarkup:
+    rows = []
+    for c in get_required_chats():
         if c.startswith("@"):
-            join_buttons.append([InlineKeyboardButton(f"Join {c}", url=f"https://t.me/{c[1:]}")])
+            rows.append([InlineKeyboardButton(f"✅ Join {c}", url=f"https://t.me/{c[1:]}")])
+    rows.append([InlineKeyboardButton("✅ I joined, check", callback_data="check_status")])
+    return InlineKeyboardMarkup(rows)
 
-    actions = [
-        [InlineKeyboardButton("✅ Check status", callback_data="check_status")],
+def build_referral_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([
         [InlineKeyboardButton("🔗 My invite link", callback_data="my_link")],
-    ]
+        [InlineKeyboardButton("✅ Check status", callback_data="check_status")],
+    ])    
 
-    return InlineKeyboardMarkup(join_buttons + actions)
 
 def build_admin_keyboard() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup([
@@ -306,44 +338,58 @@ def build_admin_keyboard() -> InlineKeyboardMarkup:
         [InlineKeyboardButton("👥 Admins", callback_data="admin_admins")],
     ])
 
-async def render_status_text(context: ContextTypes.DEFAULT_TYPE, uid: int) -> str:
+async def render_status_text(context: ContextTypes.DEFAULT_TYPE, uid: int) -> tuple[str, InlineKeyboardMarkup]:
     _, referrals = get_user(uid)
     need = get_need_referrals()
     joined = await joined_all(context, uid)
-    remaining = max(0, need - referrals)
 
     reqs = get_required_chats()
     req_text = "\n".join(f"• {c}" for c in reqs) if reqs else "• (none)"
 
+    # STEP 1: force joining first
+    if not joined:
+        text = (
+            "🔒 Access locked\n\n"
+            "Step 1: Join the required channel(s) below.\n"
+            "Then press ✅ I joined, check.\n\n"
+            "Required channels:\n"
+            f"{req_text}"
+        )
+        return text, build_join_keyboard()
+
+    # joined => count referral for inviter once (if this user came via link)
+    try_count_referral(uid)
+
+    # refresh referrals after possible counting
+    _, referrals = get_user(uid)
+    remaining = max(0, need - referrals)
+
+    # STEP 2: referrals
     text = (
-        "✅ IELTS Materials Access Bot\n\n"
+        "✅ Subscription confirmed\n\n"
+        f"Step 2: Invite {need} friends using your link.\n\n"
         f"👥 Referrals: {referrals}/{need}\n"
-        f"📌 Joined required channel(s): {'Yes' if joined else 'No'}\n\n"
-        "Required channels:\n"
-        f"{req_text}\n\n"
-        "How to unlock:\n"
-        f"1) Invite {need} friends using your link\n"
-        "2) They must press Start\n"
-        "3) You must join the required channel(s)\n"
+        f"🔗 Your invite link:\n{referral_link(uid)}\n\n"
+        "Rules:\n"
+        "• Your friend must press Start from your link\n"
+        "• Your friend must also join the required channel(s)\n"
     )
 
-    if joined and referrals >= need:
+    if referrals >= need:
         try:
             personal_invite = await get_or_create_personal_invite(context, uid)
             text += (
                 "\n🎁 Unlocked!\n"
-                "Here is your PERSONAL access link (1 use, limited time):\n"
+                "Your personal access link (1 use, limited time):\n"
                 f"{personal_invite}"
             )
         except Exception:
             text += "\n🎁 Unlocked, but bot can't create invite links. Make bot admin in reward chat and allow invite links."
     else:
-        if not joined:
-            text += "\n⚠️ Join required channel(s), then press “Check status”."
-        if remaining > 0:
-            text += f"\n⏳ You still need {remaining} more referral(s)."
+        text += f"\n⏳ You still need {remaining} more referral(s)."
 
-    return text
+    return text, build_referral_keyboard()
+
 
 # ================== COMMANDS ==================
 async def myid(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -362,15 +408,16 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     if inviter:
         ensure_user(inviter)
-        if set_invited_by(uid, inviter):
-            inc_referrals(inviter)
+        record_referral(uid, inviter)
 
-    text = await render_status_text(context, uid)
+
+    text, kb = await render_status_text(context, uid)
     await update.message.reply_text(
-        text,
-        reply_markup=build_user_keyboard(),
+        text, 
+        reply_markup=kb, 
         disable_web_page_preview=True
     )
+
 
 async def status(update: Update, context: ContextTypes.DEFAULT_TYPE):
     uid = update.effective_user.id
@@ -390,9 +437,10 @@ async def on_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
     ensure_user(uid)
 
     if q.data == "check_status":
-        text = await render_status_text(context, uid)
-        await q.edit_message_text(text, reply_markup=build_user_keyboard(), disable_web_page_preview=True)
+        text, kb = await render_status_text(context, uid)
+        await q.edit_message_text(text, reply_markup=kb, disable_web_page_preview=True)
         return
+
 
     if q.data == "my_link":
         await q.message.reply_text(
@@ -603,3 +651,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+
