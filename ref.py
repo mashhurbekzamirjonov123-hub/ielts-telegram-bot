@@ -270,14 +270,15 @@ def choose_reward_links() -> List[str]:
 
 # ---------------- membership check ----------------
 async def joined_all(context: ContextTypes.DEFAULT_TYPE, uid: int) -> bool:
-    for chat in get_required_chats():
+    for raw_c in get_required_chats():
+        ch_id = raw_c.split("|")[0] # Only use the ID/Username to check membership
         try:
-            member = await context.bot.get_chat_member(chat_id=chat, user_id=uid)
+            member = await context.bot.get_chat_member(chat_id=ch_id, user_id=uid)
             if member.status not in ("member", "administrator", "creator"):
                 return False
         except Exception:
             return False
-    return True
+    return TrueTrue
 
 # ---------------- invite cache ----------------
 def get_cached_invite(uid: int) -> Optional[Tuple[str, int]]:
@@ -318,11 +319,52 @@ async def get_or_create_personal_invite(context: ContextTypes.DEFAULT_TYPE, uid:
 # ================== UI (buttons) ==================
 def build_join_keyboard() -> InlineKeyboardMarkup:
     rows = []
-    for c in get_required_chats():
-        if c.startswith("@"):
-            rows.append([InlineKeyboardButton(f"✅ Join {c}", url=f"https://t.me/{c[1:]}")])
+    for raw_c in get_required_chats():
+        parts = raw_c.split("|")
+        ch_id = parts[0]
+        # If an invite link is provided, use it. Otherwise, fallback to standard link.
+        url = parts[1] if len(parts) > 1 else (f"https://t.me/{ch_id[1:]}" if ch_id.startswith("@") else "")
+        
+        display_name = ch_id if ch_id.startswith("@") else "Channel"
+        if url:
+            rows.append([InlineKeyboardButton(f"✅ Join {display_name}", url=url)])
+            
     rows.append([InlineKeyboardButton("✅ I joined, check", callback_data="check_status")])
     return InlineKeyboardMarkup(rows)
+
+async def joined_all(context: ContextTypes.DEFAULT_TYPE, uid: int) -> bool:
+    for raw_c in get_required_chats():
+        ch_id = raw_c.split("|")[0] # Only use the ID/Username to check membership
+        try:
+            member = await context.bot.get_chat_member(chat_id=ch_id, user_id=uid)
+            if member.status not in ("member", "administrator", "creator"):
+                return False
+        except Exception:
+            return False
+    return True
+
+async def render_status_text(context: ContextTypes.DEFAULT_TYPE, uid: int) -> tuple[str, InlineKeyboardMarkup]:
+    _, referrals = get_user(uid)
+    need = get_need_referrals()
+    joined = await joined_all(context, uid)
+
+    reqs = get_required_chats()
+    # Clean up the text so the user only sees the channel name, not the link data
+    display_reqs = [r.split("|")[0] for r in reqs]
+    req_text = "\n".join(f"• {c}" for c in display_reqs) if display_reqs else "• (none)"
+
+    # STEP 1: force joining first
+    if not joined:
+        text = (
+            "🔒 Access locked\n\n"
+            "Step 1: Join the required channel(s) below.\n"
+            "Then press ✅ I joined, check.\n\n"
+            "Required channels:\n"
+            f"{req_text}"
+        )
+        return text, build_join_keyboard()
+
+    # ... (Keep the rest of your render_status_text exactly the same from try_count_referral onwards) ...
 
 def build_referral_keyboard() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup([
@@ -651,4 +693,5 @@ def main():
 
 if __name__ == "__main__":
     main()
+
 
