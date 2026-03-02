@@ -108,6 +108,7 @@ def set_setting(key: str, value: str) -> None:
         (key, value),
     )
     conn.commit()
+
 def record_referral(invitee_id: int, inviter_id: int) -> None:
     if invitee_id == inviter_id:
         return
@@ -278,7 +279,7 @@ async def joined_all(context: ContextTypes.DEFAULT_TYPE, uid: int) -> bool:
                 return False
         except Exception:
             return False
-    return TrueTrue
+    return True
 
 # ---------------- invite cache ----------------
 def get_cached_invite(uid: int) -> Optional[Tuple[str, int]]:
@@ -332,46 +333,11 @@ def build_join_keyboard() -> InlineKeyboardMarkup:
     rows.append([InlineKeyboardButton("✅ I joined, check", callback_data="check_status")])
     return InlineKeyboardMarkup(rows)
 
-async def joined_all(context: ContextTypes.DEFAULT_TYPE, uid: int) -> bool:
-    for raw_c in get_required_chats():
-        ch_id = raw_c.split("|")[0] # Only use the ID/Username to check membership
-        try:
-            member = await context.bot.get_chat_member(chat_id=ch_id, user_id=uid)
-            if member.status not in ("member", "administrator", "creator"):
-                return False
-        except Exception:
-            return False
-    return True
-
-async def render_status_text(context: ContextTypes.DEFAULT_TYPE, uid: int) -> tuple[str, InlineKeyboardMarkup]:
-    _, referrals = get_user(uid)
-    need = get_need_referrals()
-    joined = await joined_all(context, uid)
-
-    reqs = get_required_chats()
-    # Clean up the text so the user only sees the channel name, not the link data
-    display_reqs = [r.split("|")[0] for r in reqs]
-    req_text = "\n".join(f"• {c}" for c in display_reqs) if display_reqs else "• (none)"
-
-    # STEP 1: force joining first
-    if not joined:
-        text = (
-            "🔒 Access locked\n\n"
-            "Step 1: Join the required channel(s) below.\n"
-            "Then press ✅ I joined, check.\n\n"
-            "Required channels:\n"
-            f"{req_text}"
-        )
-        return text, build_join_keyboard()
-
-    # ... (Keep the rest of your render_status_text exactly the same from try_count_referral onwards) ...
-
 def build_referral_keyboard() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup([
         [InlineKeyboardButton("🔗 My invite link", callback_data="my_link")],
         [InlineKeyboardButton("✅ Check status", callback_data="check_status")],
-    ])    
-
+    ])
 
 def build_admin_keyboard() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup([
@@ -386,7 +352,9 @@ async def render_status_text(context: ContextTypes.DEFAULT_TYPE, uid: int) -> tu
     joined = await joined_all(context, uid)
 
     reqs = get_required_chats()
-    req_text = "\n".join(f"• {c}" for c in reqs) if reqs else "• (none)"
+    # Clean up the text so the user only sees the channel name, not the link data
+    display_reqs = [r.split("|")[0] for r in reqs]
+    req_text = "\n".join(f"• {c}" for c in display_reqs) if display_reqs else "• (none)"
 
     # STEP 1: force joining first
     if not joined:
@@ -460,14 +428,13 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         disable_web_page_preview=True
     )
 
-
 async def status(update: Update, context: ContextTypes.DEFAULT_TYPE):
     uid = update.effective_user.id
     ensure_user(uid)
-    text = await render_status_text(context, uid)
+    text, kb = await render_status_text(context, uid)
     await update.message.reply_text(
         text,
-        reply_markup=build_user_keyboard(),
+        reply_markup=kb,
         disable_web_page_preview=True
     )
 
@@ -482,7 +449,6 @@ async def on_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
         text, kb = await render_status_text(context, uid)
         await q.edit_message_text(text, reply_markup=kb, disable_web_page_preview=True)
         return
-
 
     if q.data == "my_link":
         await q.message.reply_text(
@@ -527,7 +493,7 @@ async def admin(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "Commands:\n"
         "/setneed <number>\n"
         "/setrewardmode random|rotate|all\n"
-        "/addreq @channel\n"
+        "/addreq @channel [link]\n"
         "/delreq @channel\n"
         "/reqs\n"
         "/setrewardchat -100xxxxxxxxxx\n"
@@ -620,16 +586,27 @@ async def addreq(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_admin(update.effective_user.id):
         return
     if not context.args:
-        await update.message.reply_text("Usage: /addreq @channelusername")
+        await update.message.reply_text(
+            "Usage: /addreq @channelusername [invite_link]\n"
+            "Example: /addreq @jonibeksielts9 https://t.me/+AbCdEfGh"
+        )
         return
+    
     ch = context.args[0].strip()
-    if not ch.startswith("@"):
-        await update.message.reply_text("❌ Channel must start with @")
+    link = context.args[1].strip() if len(context.args) > 1 else ""
+
+    if not ch.startswith("@") and not ch.startswith("-100"):
+        await update.message.reply_text("❌ Channel must start with @ or -100")
         return
+
+    entry = f"{ch}|{link}" if link else ch
     reqs = get_required_chats()
-    if ch not in reqs:
-        reqs.append(ch)
-        set_required_chats(reqs)
+    
+    # Remove old entry if updating an existing channel
+    reqs = [r for r in reqs if r.split("|")[0] != ch]
+    reqs.append(entry)
+    
+    set_required_chats(reqs)
     await update.message.reply_text("✅ Required channels updated.\n" + "\n".join(reqs))
 
 async def delreq(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -638,8 +615,10 @@ async def delreq(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not context.args:
         await update.message.reply_text("Usage: /delreq @channelusername")
         return
+    
     ch = context.args[0].strip()
-    reqs = [r for r in get_required_chats() if r != ch]
+    # Target just the ID part when deleting
+    reqs = [r for r in get_required_chats() if r.split("|")[0] != ch]
     set_required_chats(reqs)
     await update.message.reply_text("✅ Required channels updated.\n" + ("\n".join(reqs) if reqs else "(none)"))
 
@@ -693,5 +672,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-
-
